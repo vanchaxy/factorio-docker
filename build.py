@@ -14,6 +14,8 @@ PLATFORMS = [
     "linux/amd64",
 ]
 
+DEFAULT_REGISTRY = "ghcr.io/factoriotools"
+
 
 def create_builder(build_dir, builder_name, platform):
     check_exists_command = ["docker", "buildx", "inspect", builder_name]
@@ -49,44 +51,60 @@ def build_singlearch(build_dir, build_args, image_type="regular"):
         exit(1)
 
 
-def push_singlearch(tags):
+def push_singlearch(tags, image_name):
     for tag in tags:
         try:
-            subprocess.run(["docker", "push", f"factoriotools/factorio:{tag}"],
+            subprocess.run(["docker", "push", f"{image_name}:{tag}"],
                             check=True)
         except subprocess.CalledProcessError:
             print("Docker push failed")
             exit(1)
 
 
-def build_and_push(sha256, version, tags, push, multiarch, dockerfile="Dockerfile", builder_suffix=""):
+def build_and_push(sha256, version, tags, push, multiarch, image_name,
+                   dockerfile="Dockerfile", builder_suffix=""):
     build_dir = tempfile.mktemp()
     shutil.copytree("docker", build_dir)
     build_args = ["-f", dockerfile, "--build-arg", f"VERSION={version}", "--build-arg", f"SHA256={sha256}", "."]
     for tag in tags:
-        build_args.extend(["-t", f"factoriotools/factorio:{tag}"])
-    
+        build_args.extend(["-t", f"{image_name}:{tag}"])
+
     image_type = "rootless" if "rootless" in dockerfile.lower() else "regular"
-    
+
     if multiarch:
         build_and_push_multiarch(build_dir, build_args, push, builder_suffix)
     else:
         build_singlearch(build_dir, build_args, image_type)
         if push:
-            push_singlearch(tags)
+            push_singlearch(tags, image_name)
 
 
-def login():
-    try:
-        username = os.environ["DOCKER_USERNAME"]
-        password = os.environ["DOCKER_PASSWORD"]
-        subprocess.run(["docker", "login", "-u", username, "-p", password], check=True)
-    except KeyError:
-        print("Username and password need to be given")
-        exit(1)
-    except subprocess.CalledProcessError:
-        print("Docker login failed")
-        exit(1)
+def login(registry):
+    if registry.startswith("ghcr.io"):
+        try:
+            token = os.environ["GITHUB_TOKEN"]
+            actor = os.environ.get("GITHUB_ACTOR", "")
+            subprocess.run(
+                ["docker", "login", "ghcr.io", "-u", actor, "--password-stdin"],
+                input=token.encode(), check=True,
+            )
+        except KeyError:
+            print("GITHUB_TOKEN must be set for ghcr.io authentication")
+            exit(1)
+        except subprocess.CalledProcessError:
+            print("Docker login to ghcr.io failed")
+            exit(1)
+    else:
+        try:
+            username = os.environ["DOCKER_USERNAME"]
+            password = os.environ["DOCKER_PASSWORD"]
+            subprocess.run(["docker", "login", "-u", username, "-p", password], check=True)
+        except KeyError:
+            print("Username and password need to be given")
+            exit(1)
+        except subprocess.CalledProcessError:
+            print("Docker login failed")
+            exit(1)
 
 
 def generate_rootless_tags(original_tags):
@@ -96,24 +114,28 @@ def generate_rootless_tags(original_tags):
 
 def main():
     parser = argparse.ArgumentParser(description='Build Factorio Docker images')
-    parser.add_argument('--push-tags', action='store_true', help='Push images to Docker Hub')
+    parser.add_argument('--push-tags', action='store_true', help='Push images to registry')
     parser.add_argument('--multiarch', action='store_true', help='Build multi-architecture images')
     parser.add_argument('--rootless', action='store_true', help='Build only rootless images')
     parser.add_argument('--both', action='store_true', help='Build both regular and rootless images')
-    parser.add_argument('--only-stable-latest', action='store_true', 
+    parser.add_argument('--only-stable-latest', action='store_true',
                         help='Build only stable and latest versions (for rootless by default)')
-    
+    parser.add_argument('--registry', type=str, default=DEFAULT_REGISTRY,
+                        help=f'Container registry prefix (default: {DEFAULT_REGISTRY})')
+
     args = parser.parse_args()
-    
+
+    image_name = f"{args.registry}/factorio"
+
     # Default behavior: build regular images unless specified otherwise
     build_regular = not args.rootless or args.both
     build_rootless = args.rootless or args.both
-    
+
     with open(os.path.join(os.path.dirname(__file__), "buildinfo.json")) as file_handle:
         builddata = json.load(file_handle)
 
     if args.push_tags:
-        login()
+        login(args.registry)
 
     # Filter versions if needed
     versions_to_build = []
@@ -124,15 +146,15 @@ def main():
                 versions_to_build.append((version, buildinfo))
         else:
             versions_to_build.append((version, buildinfo))
-    
+
     # Build regular images
     if build_regular:
         print("Building regular images...")
         for version, buildinfo in versions_to_build:
             sha256 = buildinfo["sha256"]
             tags = buildinfo["tags"]
-            build_and_push(sha256, version, tags, args.push_tags, args.multiarch)
-    
+            build_and_push(sha256, version, tags, args.push_tags, args.multiarch, image_name)
+
     # Build rootless images
     if build_rootless:
         print("Building rootless images...")
@@ -144,13 +166,13 @@ def main():
                     rootless_versions.append((version, buildinfo))
         else:
             rootless_versions = versions_to_build
-            
+
         for version, buildinfo in rootless_versions:
             sha256 = buildinfo["sha256"]
             original_tags = buildinfo["tags"]
             rootless_tags = generate_rootless_tags(original_tags)
-            build_and_push(sha256, version, rootless_tags, args.push_tags, args.multiarch, 
-                         dockerfile="Dockerfile.rootless", builder_suffix="-rootless")
+            build_and_push(sha256, version, rootless_tags, args.push_tags, args.multiarch,
+                         image_name, dockerfile="Dockerfile.rootless", builder_suffix="-rootless")
 
 
 if __name__ == '__main__':
